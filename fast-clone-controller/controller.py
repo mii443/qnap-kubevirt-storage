@@ -17,6 +17,10 @@ VERSION = "v1alpha1"
 PLURAL = "qnapfastclones"
 
 
+class PermanentReconcileError(RuntimeError):
+    pass
+
+
 def log(message):
     print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), message, flush=True)
 
@@ -612,10 +616,25 @@ def quantity_bytes(value):
     return number * multiplier
 
 
+def status_int(status, key, default=0):
+    try:
+        return int(status.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def timestamp_utc(epoch=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch or time.time()))
+
+
+def retry_delay_seconds(retry_count):
+    return min(300, 2 ** min(max(retry_count, 1), 8))
+
+
 def parse_snapshot_handle(handle):
     parts = (handle or "").split("/")
     if len(parts) != 2:
-        raise RuntimeError(f"unexpected snapshotHandle {handle!r}")
+        raise PermanentReconcileError(f"unexpected snapshotHandle {handle!r}")
     return parts[0], parts[1]
 
 
@@ -627,7 +646,21 @@ def reconcile_item(kube, nas, item, source_cache):
     except Exception as e:
         log(f"{ns}/{name}: error: {e}")
         status = item.get("status") or {}
-        kube.patch_fastclone_status(ns, name, {**status, "phase": "Failed", "message": str(e)})
+        if isinstance(e, PermanentReconcileError):
+            kube.patch_fastclone_status(ns, name, {**status, "phase": "Failed", "message": str(e)})
+            return
+
+        retry_count = status_int(status, "retryCount") + 1
+        retry_after = int(time.time()) + retry_delay_seconds(retry_count)
+        kube.patch_fastclone_status(ns, name, {
+            **status,
+            "phase": "Retrying",
+            "message": str(e),
+            "retryCount": retry_count,
+            "lastErrorTime": timestamp_utc(),
+            "retryAfterTime": timestamp_utc(retry_after),
+            "retryAfterUnix": retry_after,
+        })
 
 
 def restart_trident_controller(kube, namespace):
@@ -685,10 +718,15 @@ def reconcile(kube, nas, item, source_cache):
 
     if status.get("phase") in ("Ready", "Failed"):
         return
+    if status.get("phase") == "Retrying":
+        retry_after = status_int(status, "retryAfterUnix")
+        if retry_after > int(time.time()):
+            log(f"{namespace}/{name}: retry backoff until {status.get('retryAfterTime', retry_after)}")
+            return
 
     source_snapshot = spec.get("sourceSnapshotName")
     if not source_snapshot:
-        raise RuntimeError("spec.sourceSnapshotName is required")
+        raise PermanentReconcileError("spec.sourceSnapshotName is required")
     source_snapshot_ns = spec.get("sourceSnapshotNamespace", namespace)
     target_ns = spec.get("targetNamespace", namespace)
     target_pvc = spec.get("targetPVCName", name)
@@ -727,7 +765,7 @@ def reconcile(kube, nas, item, source_cache):
             return
         vsc_name = vs_status.get("boundVolumeSnapshotContentName")
         if not vsc_name:
-            raise RuntimeError("source snapshot has no boundVolumeSnapshotContentName")
+            raise PermanentReconcileError("source snapshot has no boundVolumeSnapshotContentName")
         vsc = kube.get(f"/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents/{vsc_name}")
         if not vsc:
             raise RuntimeError(f"VolumeSnapshotContent {vsc_name} not found")
@@ -739,7 +777,7 @@ def reconcile(kube, nas, item, source_cache):
         source_attrs = source_csi.get("volumeAttributes") or {}
         source_share = source_attrs.get("internalName")
         if not source_share:
-            raise RuntimeError(f"source PV {source_pv_name} has no csi.volumeAttributes.internalName")
+            raise PermanentReconcileError(f"source PV {source_pv_name} has no csi.volumeAttributes.internalName")
         source_tv = kube.get(f"/apis/trident.qnap.io/v1/namespaces/{trident_ns}/tridentvolumes/{source_pv_name}") or {}
         source_info = {
             "vs_status": vs_status,
@@ -815,7 +853,7 @@ def reconcile(kube, nas, item, source_cache):
         requested_bytes = quantity_bytes(requested_capacity)
         source_bytes = quantity_bytes(source_capacity)
         if requested_bytes and source_bytes and requested_bytes > source_bytes:
-            raise RuntimeError(f"requested capacity {requested_capacity} exceeds source capacity {source_capacity}")
+            raise PermanentReconcileError(f"requested capacity {requested_capacity} exceeds source capacity {source_capacity}")
     capacity = source_capacity or requested_capacity
     import_capacity = spec.get("importCapacity") or source_tv_config.get("realSize") or capacity
     mount_options = spec.get("mountOptions") or source_spec.get("mountOptions") or []

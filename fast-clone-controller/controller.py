@@ -76,15 +76,21 @@ class Kube:
 
         proc = subprocess.run(cmd, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50)
         output = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         marker = "\n__HTTP_STATUS__:"
         if marker not in output:
-            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"{method} {path} failed: curl rc={proc.returncode}: {stderr}")
         raw, status_raw = output.rsplit(marker, 1)
-        status = int(status_raw.strip())
+        try:
+            status = int(status_raw.strip())
+        except ValueError as e:
+            raise RuntimeError(f"{method} {path} failed: invalid HTTP status {status_raw!r}: {stderr}") from e
+        if proc.returncode != 0:
+            detail = stderr or raw.strip()
+            raise RuntimeError(f"{method} {path} failed: curl rc={proc.returncode} HTTP {status}: {detail}")
         if status == 404:
             return None
-        if status >= 400:
+        if status < 200 or status >= 400:
             raise RuntimeError(f"{method} {path} failed: HTTP {status}: {raw}")
         if not raw:
             return None

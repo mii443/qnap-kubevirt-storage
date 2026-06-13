@@ -1268,6 +1268,9 @@ def ensure_fastclone_for_pvc(kube, pvc):
         "accessModes": spec.get("accessModes") or ["ReadWriteMany"],
         "volumeMode": spec.get("volumeMode", "Filesystem"),
     }
+    requested_storage = pvc_requested_storage(pvc)
+    if requested_storage:
+        qfc_spec["capacity"] = requested_storage
 
     passthrough = {
         "qnap.mii.dev/nas-clone-name": "nasCloneName",

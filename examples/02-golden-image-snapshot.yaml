@@ -1,0 +1,19 @@
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: qnap-golden-image-snapshotclass
+driver: csi.trident.qnap.io
+deletionPolicy: Retain
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: golden-ubuntu-2404-snap
+  namespace: vm-images
+  labels:
+    app.kubernetes.io/name: golden-ubuntu-2404
+    qnap.mii.dev/golden-image: "true"
+spec:
+  volumeSnapshotClassName: qnap-golden-image-snapshotclass
+  source:
+    persistentVolumeClaimName: golden-ubuntu-2404

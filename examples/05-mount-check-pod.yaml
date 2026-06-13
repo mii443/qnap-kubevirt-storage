@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ubuntu-2404-fastclone-mount-check
+  namespace: vm-images
+  labels:
+    app.kubernetes.io/name: ubuntu-2404-fastclone-mount-check
+    qnap.mii.dev/fast-clone-example: "true"
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 107
+    runAsGroup: 107
+    fsGroup: 107
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: busybox:1.36
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          id
+          mount | grep /mnt/rootdisk || true
+          ls -la /mnt/rootdisk
+          stat -c '%n %s %u:%g %a' /mnt/rootdisk/disk.img
+      volumeMounts:
+        - name: rootdisk
+          mountPath: /mnt/rootdisk
+  volumes:
+    - name: rootdisk
+      persistentVolumeClaim:
+        claimName: ubuntu-2404-fastclone-example

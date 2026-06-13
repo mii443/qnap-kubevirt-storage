@@ -53,3 +53,6 @@ Create a clone from a ready `VolumeSnapshot`:
 kubectl apply -f fast-clone-controller/manifests/pvc-from-snapshot-fastclone-proxy-test.yaml
 kubectl get qnapfastclone,pvc -n vm-images
 ```
+
+See `examples/` for an end-to-end golden image, snapshot, fast clone PVC, and
+KubeVirt VM workflow.

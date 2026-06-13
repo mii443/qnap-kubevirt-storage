@@ -1,0 +1,20 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: golden-ubuntu-2404
+  namespace: vm-images
+  labels:
+    app.kubernetes.io/name: golden-ubuntu-2404
+    qnap.mii.dev/golden-image: "true"
+spec:
+  source:
+    http:
+      url: https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+  storage:
+    storageClassName: qnap
+    accessModes:
+      - ReadWriteMany
+    volumeMode: Filesystem
+    resources:
+      requests:
+        storage: 40Gi

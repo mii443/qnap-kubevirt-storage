@@ -1,0 +1,58 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-2404-fastclone-example
+  namespace: vm-images
+  labels:
+    app.kubernetes.io/name: ubuntu-2404-fastclone-example
+    qnap.mii.dev/fast-clone-example: "true"
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ubuntu-2404-fastclone-example
+        kubevirt.io/domain: ubuntu-2404-fastclone-example
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 1
+          sockets: 1
+          threads: 1
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              model: virtio
+              masquerade: {}
+          networkInterfaceMultiqueue: true
+          rng: {}
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 2Gi
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: ubuntu-2404-fastclone-example
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |-
+              #cloud-config
+              user: ubuntu
+              password: ubuntu
+              chpasswd:
+                expire: false
+              ssh_pwauth: true

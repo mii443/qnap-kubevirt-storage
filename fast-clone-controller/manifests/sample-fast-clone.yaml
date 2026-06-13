@@ -1,0 +1,10 @@
+apiVersion: qnap.mii.dev/v1alpha1
+kind: QnapFastClone
+metadata:
+  name: ubuntu-2404-fast-clone-1
+  namespace: vm-images
+spec:
+  sourceSnapshotName: golden-ubuntu-2404-snap
+  targetPVCName: ubuntu-2404-fast-clone-1
+  storageClassName: qnap
+  reclaimPolicy: Retain

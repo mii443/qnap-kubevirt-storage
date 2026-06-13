@@ -1,0 +1,188 @@
+#!/bin/busybox sh
+set -eu
+
+default_opts="${QNAP_CSI_CIFS_MOUNT_OPTIONS:-uid=107,gid=107,forceuid,forcegid,file_mode=0660,dir_mode=0770,noperm,nobrl}"
+
+base="$(/bin/busybox basename "$0")"
+case "$0" in
+  /qnap/*) original=/qnap/.orig/mount ;;
+  */mount.cifs) original=/sbin/mount.cifs.real ;;
+  *) original=/bin/mount.real ;;
+esac
+
+is_cifs=false
+case "$base" in
+  mount.cifs) is_cifs=true ;;
+esac
+
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-t" ]; then
+    case "$arg" in
+      cifs|smb|smbfs) is_cifs=true ;;
+    esac
+    prev=""
+    continue
+  fi
+  case "$arg" in
+    -t) prev="-t" ;;
+    -t=cifs|-t=smb|-t=smbfs) is_cifs=true ;;
+  esac
+done
+
+if [ "$is_cifs" != "true" ]; then
+  if [ "${QNAP_CSI_MOUNT_WRAPPER_DRY_RUN:-}" = "1" ]; then
+    /bin/busybox printf '%s\n' "$original" "$@"
+    exit 0
+  fi
+  exec "$original" "$@"
+fi
+
+k8s_opts=""
+if [ "${QNAP_CSI_K8S_MOUNT_OPTIONS_DISABLED:-}" != "1" ] && [ -x /qnap/k8s-mount-options ]; then
+  k8s_opts="$(/qnap/k8s-mount-options "$@" || true)"
+fi
+
+extra_opts="$k8s_opts"
+if [ -n "$default_opts" ]; then
+  if [ -n "$extra_opts" ]; then
+    extra_opts="${extra_opts},${default_opts}"
+  else
+    extra_opts="$default_opts"
+  fi
+fi
+
+if [ -z "$extra_opts" ]; then
+  if [ "${QNAP_CSI_MOUNT_WRAPPER_DRY_RUN:-}" = "1" ]; then
+    /bin/busybox printf '%s\n' "$original" "$@"
+    exit 0
+  fi
+  exec "$original" "$@"
+fi
+
+append_opts() {
+  current="$1"
+  additions=""
+  old_ifs_append="$IFS"
+
+  option_key() {
+    case "$1" in
+      *=*) /bin/busybox printf '%s' "${1%%=*}" ;;
+      *) /bin/busybox printf '%s' "$1" ;;
+    esac
+  }
+
+  has_option_key() {
+    wanted_key="$1"
+    current_opts="$2"
+    old_ifs_has="$IFS"
+    IFS=','
+    for current_opt in $current_opts; do
+      [ -n "$current_opt" ] || continue
+      current_key="$(option_key "$current_opt")"
+      if [ "$current_key" = "$wanted_key" ]; then
+        IFS="$old_ifs_has"
+        return 0
+      fi
+    done
+    IFS="$old_ifs_has"
+    return 1
+  }
+
+  IFS=','
+  for opt in $extra_opts; do
+    [ -n "$opt" ] || continue
+    key="$(option_key "$opt")"
+
+    # Honor explicit mount options if the driver already passed them through.
+    # For example, uid=999 prevents the default uid=107 from being appended.
+    if has_option_key "$key" "$current"; then
+      continue
+    fi
+    if has_option_key "$key" "$additions"; then
+      continue
+    fi
+
+    # Treat perm/noperm as mutually exclusive intent.
+    if [ "$key" = "noperm" ] && has_option_key "perm" "$current"; then
+      continue
+    fi
+    if [ "$key" = "noperm" ] && has_option_key "perm" "$additions"; then
+      continue
+    fi
+
+    if [ -z "$additions" ]; then
+      additions="$opt"
+    else
+      additions="${additions},${opt}"
+    fi
+  done
+  IFS="$old_ifs_append"
+
+  if [ -z "$additions" ]; then
+    /bin/busybox printf '%s' "$current"
+  elif [ -z "$current" ]; then
+    /bin/busybox printf '%s' "$additions"
+  else
+    /bin/busybox printf '%s,%s' "$current" "$additions"
+  fi
+}
+
+new_args=""
+skip_next=false
+inserted=false
+
+for arg in "$@"; do
+  if [ "$skip_next" = "true" ]; then
+    merged_opts="$(append_opts "$arg")"
+    new_args="${new_args}
+${merged_opts}"
+    skip_next=false
+    inserted=true
+    continue
+  fi
+
+  case "$arg" in
+    -o)
+      new_args="${new_args}
+${arg}"
+      skip_next=true
+      ;;
+    -o*)
+      opt_value="${arg#-o}"
+      merged_opts="$(append_opts "$opt_value")"
+      new_args="${new_args}
+-o${merged_opts}"
+      inserted=true
+      ;;
+    *)
+      new_args="${new_args}
+${arg}"
+      ;;
+  esac
+done
+
+if [ "$inserted" != "true" ]; then
+  new_args="${new_args}
+-o
+${extra_opts}"
+fi
+
+set --
+old_ifs="$IFS"
+IFS='
+'
+for arg in $new_args; do
+  [ -n "$arg" ] || continue
+  set -- "$@" "$arg"
+done
+IFS="$old_ifs"
+
+/bin/busybox echo "qnap-csi-mount-wrapper: ${base}: applying CIFS mount option candidates: ${extra_opts}" >&2
+
+if [ "${QNAP_CSI_MOUNT_WRAPPER_DRY_RUN:-}" = "1" ]; then
+  /bin/busybox printf '%s\n' "$original" "$@"
+  exit 0
+fi
+
+exec "$original" "$@"

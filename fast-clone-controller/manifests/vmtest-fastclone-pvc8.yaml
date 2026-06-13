@@ -1,0 +1,57 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-2404-fastclone-pvc8-vm
+  namespace: vm-images
+  labels:
+    app: ubuntu-2404-fastclone-pvc8-vm
+    qnap.mii.dev/fast-clone-vmtest: "true"
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        app: ubuntu-2404-fastclone-pvc8-vm
+        kubevirt.io/domain: ubuntu-2404-fastclone-pvc8-vm
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 1
+          sockets: 1
+          threads: 1
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              model: virtio
+              masquerade: {}
+          networkInterfaceMultiqueue: true
+          rng: {}
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 2Gi
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: ubuntu-2404-fastclone-pvc8
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |-
+              #cloud-config
+              user: ubuntu
+              password: ubuntu
+              chpasswd: { expire: False }
+              ssh_pwauth: true

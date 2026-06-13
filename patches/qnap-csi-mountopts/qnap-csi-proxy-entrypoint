@@ -1,0 +1,51 @@
+#!/bin/busybox sh
+set -eu
+
+role=""
+for arg in "$@"; do
+  case "$arg" in
+    --csi_role=*) role="${arg#--csi_role=}" ;;
+  esac
+done
+
+if [ "$role" != "controller" ] || [ "${QNAP_CSI_CONTROLLER_PUBLISH_PROXY:-1}" = "0" ]; then
+  exec /trident_orchestrator.real "$@"
+fi
+
+public_endpoint="${CSI_ENDPOINT:-unix://plugin/csi.sock}"
+real_endpoint="${QNAP_CSI_REAL_ENDPOINT:-unix://plugin/csi-real.sock}"
+export CSI_ENDPOINT="$real_endpoint"
+
+real_args=""
+for arg in "$@"; do
+  case "$arg" in
+    --csi_endpoint=*) arg="--csi_endpoint=$real_endpoint" ;;
+  esac
+  real_args="$real_args $arg"
+done
+
+# The QNAP operator passes --csi_endpoint as an argv flag, so changing only the
+# environment is not enough.  The generated args do not contain shell spaces.
+/trident_orchestrator.real $real_args &
+real_pid="$!"
+
+QNAP_CSI_PROXY_LISTEN="$public_endpoint" QNAP_CSI_PROXY_TARGET="$real_endpoint" /qnap/csi-controller-publish-proxy &
+proxy_pid="$!"
+
+term() {
+  kill "$proxy_pid" "$real_pid" 2>/dev/null || true
+  wait "$proxy_pid" "$real_pid" 2>/dev/null || true
+}
+trap term INT TERM
+
+while true; do
+  if ! kill -0 "$real_pid" 2>/dev/null; then
+    wait "$real_pid" || exit "$?"
+    exit 1
+  fi
+  if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    wait "$proxy_pid" || exit "$?"
+    exit 1
+  fi
+  /bin/busybox sleep 2
+done

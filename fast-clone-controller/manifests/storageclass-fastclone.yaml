@@ -1,0 +1,15 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: qnap-fastclone
+provisioner: qnap.mii.dev/fast-clone
+allowVolumeExpansion: true
+mountOptions:
+  - uid=107
+  - gid=107
+  - forceuid
+  - forcegid
+  - file_mode=0660
+  - dir_mode=0770
+  - noperm
+  - nobrl

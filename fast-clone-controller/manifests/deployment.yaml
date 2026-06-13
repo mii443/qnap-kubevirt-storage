@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qnap-fast-clone-controller
+  namespace: trident
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qnap-fast-clone-controller
+  template:
+    metadata:
+      labels:
+        app: qnap-fast-clone-controller
+    spec:
+      serviceAccountName: qnap-fast-clone-controller
+      containers:
+        - name: controller
+          image: registry.mii.dev/qnap-fast-clone-controller:0.1.24
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WATCH_NAMESPACE
+              value: vm-images
+            - name: AUTO_PROVISION_PVCS
+              value: "true"
+            - name: FAST_CLONE_STORAGE_CLASS_NAME
+              value: qnap-fastclone
+            - name: KUBE_API_URL
+              value: https://172.31.0.254:6443
+            - name: NAS_HOST
+              value: 192.168.1.16
+            - name: NAS_USER
+              valueFrom:
+                secretKeyRef:
+                  name: qts-csi-smb
+                  key: username
+            - name: NAS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: qts-csi-smb
+                  key: password
+            - name: QNAP_SMB_USER
+              value: mii
+            - name: NODE_STAGE_SECRET_NAME
+              value: qts-csi-smb
+            - name: NODE_STAGE_SECRET_NAMESPACE
+              value: trident
+            - name: STORAGE_CLASS_NAME
+              value: qnap
+            - name: WATCH_TIMEOUT_SECONDS
+              value: "300"
+            - name: WATCH_RESTART_SLEEP_SECONDS
+              value: "0.2"
+            - name: SHARE_PERMISSION_MODE
+              value: skip
+            - name: CHECK_EXISTING_NAS_CLONE
+              value: "false"
+            - name: FORCE_BOUND_STATUS
+              value: "true"
+            - name: TRIDENT_REGISTRATION_MODE
+              value: proxy-direct
+            - name: TRIDENT_BACKEND_NAME
+              value: qts
+            - name: IMPORT_WAIT_SECONDS
+              value: "300"
+            - name: RESTART_TRIDENT_CONTROLLER_ON_DIRECT
+              value: "false"
+            - name: TRIDENT_CONTROLLER_DEPLOYMENT
+              value: trident-controller
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

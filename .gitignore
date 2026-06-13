@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.swp
+.DS_Store
+
+# Local cluster/NAS secrets and one-off experiments.
+backend.yaml
+sc-secret.yaml
+sc.yaml
+sp.yaml
+golden-ubuntu.yaml
+qnap-direct-pvc-clone-test.yaml
+qnap-snapshot-clone-mount-check.yaml
+qnap-snapshot-clone-test.yaml
+
+# Upstream checkout kept locally for reference.
+QNAP-CSI-PlugIn/
+
+# Build outputs.
+patches/qnap-csi-mountopts/csi-controller-publish-proxy

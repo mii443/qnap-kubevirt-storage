@@ -235,7 +235,10 @@ class Nas:
             f"{self.ssh_user}@{self.host}",
             remote_cmd,
         ]
-        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        try:
+            proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"ssh command timed out after {timeout} seconds") from e
         if proc.returncode != 0:
             raise RuntimeError(f"ssh command failed rc={proc.returncode}: {proc.stdout.strip()}")
         return proc.stdout
@@ -257,14 +260,17 @@ class Nas:
             f"{self.ssh_user}@{self.host}",
             "sh -s",
         ]
-        proc = subprocess.run(
-            cmd,
-            input=script,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=script,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"ssh script timed out after {timeout} seconds") from e
         if proc.returncode != 0:
             raise RuntimeError(f"ssh script failed rc={proc.returncode}: {proc.stdout.strip()}")
         return proc.stdout
@@ -343,6 +349,54 @@ class Nas:
             if len(cols) >= 2 and cols[0] == lv_name:
                 return cols[1]
         raise RuntimeError(f"could not find UUID for {lv_name}")
+
+    def resize_volume(self, volume_id, target_capacity_bytes):
+        script = f"""set -u
+nas_user={shlex.quote(self.user)}
+nas_password={shlex.quote(self.password)}
+volume_id={shlex.quote(str(volume_id))}
+target_capacity_bytes={shlex.quote(str(target_capacity_bytes))}
+
+sid_out=$(qcli -l user="$nas_user" pw="$nas_password" saveauthsid=no)
+sid=$(printf '%s\\n' "$sid_out" | awk '/sid is/ {{ print $3; exit }}')
+if [ -z "$sid" ]; then
+  echo "__QFC_ERROR__=could not parse qcli sid"
+  printf '%s\\n' "$sid_out"
+  exit 1
+fi
+
+echo "__QFC_RESIZE_START__=$target_capacity_bytes"
+i=0
+resize_ok=""
+resize_out=""
+while [ "$i" -lt 60 ]; do
+  resize_out=$(qcli_volume -e volumeID="$volume_id" Capacity="$target_capacity_bytes" converttype=no sid="$sid" 2>&1)
+  if printf '%s\\n' "$resize_out" | grep -iq ok; then
+    resize_ok="yes"
+    break
+  fi
+  if ! printf '%s\\n' "$resize_out" | grep -Eiq 'Initializing|Creating Shared Folders'; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+if [ "$resize_ok" != "yes" ]; then
+  echo "__QFC_ERROR__=qcli resize did not report success"
+  printf '%s\\n' "$resize_out"
+  exit 1
+fi
+echo "__QFC_RESIZED_BYTES__=$target_capacity_bytes"
+"""
+        out = self.ssh_script(script, timeout=240)
+        result = {}
+        for line in out.splitlines():
+            if line.startswith("__QFC_") and "=" in line:
+                key, value = line.split("=", 1)
+                result[key.removeprefix("__QFC_").removesuffix("__").lower()] = value
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+        return result
 
     def fast_clone_snapshot(
         self,
@@ -426,20 +480,21 @@ if [ -z "$clone_volume_id" ]; then
     printf '%s\\n' "$clone_out"
     exit 1
   }}
-  if [ "$check_existing_clone" = "yes" ]; then
-    i=0
-    while [ "$i" -lt 90 ]; do
-      clone_volume_id=$(find_volume_id "$clone_name")
-      [ -n "$clone_volume_id" ] && break
-      i=$((i + 1))
-      sleep 1
-    done
-  fi
+fi
+if [ -z "$clone_volume_id" ]; then
+  i=0
+  while [ "$i" -lt 90 ]; do
+    clone_volume_id=$(find_volume_id "$clone_name")
+    [ -n "$clone_volume_id" ] && break
+    i=$((i + 1))
+    sleep 1
+  done
 fi
 
 share_name=""
 share_path=""
 cachedev=""
+share_out=""
 i=0
 while [ "$i" -lt 120 ]; do
   if [ -z "$clone_volume_id" ]; then
@@ -740,6 +795,8 @@ def reconcile(kube, nas, item, source_cache):
     trident_ns = spec.get("tridentNamespace", os.environ.get("TRIDENT_NAMESPACE", "trident"))
     permission_mode = spec.get("sharePermissionMode", os.environ.get("SHARE_PERMISSION_MODE", "if-missing"))
     check_existing_clone = str(spec.get("checkExistingNasClone", os.environ.get("CHECK_EXISTING_NAS_CLONE", "true"))).lower() in ("1", "true", "yes")
+    if status.get("phase") == "Retrying":
+        check_existing_clone = True
     force_bound_status = str(spec.get("forceBoundStatus", os.environ.get("FORCE_BOUND_STATUS", "false"))).lower() in ("1", "true", "yes")
     registration_mode = (spec.get("registrationMode") or os.environ.get("TRIDENT_REGISTRATION_MODE", "direct")).lower()
     if registration_mode in ("direct-proxy", "proxy"):
@@ -799,6 +856,18 @@ def reconcile(kube, nas, item, source_cache):
     source_share = source_info["source_share"]
     source_tv = source_info["source_tv"]
     source_tv_config = source_info["source_tv_config"]
+    source_spec = source_pv.get("spec") or {}
+    source_capacity = ((source_spec.get("capacity") or {}).get("storage")) or str(vs_status.get("restoreSize") or "")
+    requested_capacity = spec.get("capacity")
+    source_bytes = quantity_bytes(source_capacity)
+    requested_bytes = quantity_bytes(requested_capacity)
+    resize_target_bytes = ""
+    if requested_capacity and requested_bytes and source_bytes and requested_bytes > source_bytes:
+        capacity = requested_capacity
+        resize_target_bytes = str(requested_bytes)
+    else:
+        capacity = source_capacity or requested_capacity
+    import_capacity = spec.get("importCapacity") or (capacity if resize_target_bytes else source_tv_config.get("realSize") or capacity)
 
     existing_pv = kube.get(f"/api/v1/persistentvolumes/{pv_name}")
     existing_pvc = kube.get(f"/api/v1/namespaces/{target_ns}/persistentvolumeclaims/{target_pvc}")
@@ -817,6 +886,31 @@ def reconcile(kube, nas, item, source_cache):
         return
     if existing_pv and existing_pvc:
         existing_pvc_spec = existing_pvc.get("spec") or {}
+        existing_pv_spec = existing_pv.get("spec") or {}
+        claim_ref = existing_pv_spec.get("claimRef") or {}
+        pvc_uid = ((existing_pvc.get("metadata") or {}).get("uid")) or ""
+        if pvc_uid and claim_ref.get("uid") != pvc_uid:
+            kube.patch(
+                f"/api/v1/persistentvolumes/{pv_name}",
+                {
+                    "spec": {
+                        "claimRef": {
+                            "apiVersion": "v1",
+                            "kind": "PersistentVolumeClaim",
+                            "namespace": target_ns,
+                            "name": target_pvc,
+                            "uid": pvc_uid,
+                        }
+                    }
+                },
+            )
+        existing_capacity = ((existing_pv_spec.get("capacity") or {}).get("storage")) or ""
+        existing_bytes = quantity_bytes(existing_capacity)
+        nas_volume_id = ((existing_pv.get("metadata") or {}).get("annotations") or {}).get("qnap.mii.dev/nas-volume-id", "")
+        if requested_capacity and requested_bytes and existing_bytes and requested_bytes > existing_bytes and nas_volume_id:
+            log(f"{namespace}/{name}: expanding existing NAS clone volume={nas_volume_id} to {requested_capacity}")
+            nas.resize_volume(nas_volume_id, str(requested_bytes))
+            kube.patch(f"/api/v1/persistentvolumes/{pv_name}", {"spec": {"capacity": {"storage": requested_capacity}}})
         if existing_pvc_spec.get("volumeName") != pv_name:
             kube.patch(
                 f"/api/v1/namespaces/{target_ns}/persistentvolumeclaims/{target_pvc}",
@@ -844,18 +938,11 @@ def reconcile(kube, nas, item, source_cache):
     share_name = nas_result["share_name"]
     share_path = nas_result["share_path"]
     internal_id = nas_result["internal_id"]
+    if resize_target_bytes:
+        log(f"{namespace}/{name}: expanding NAS clone volume={clone_volume_id} to {requested_capacity}")
+        nas.resize_volume(clone_volume_id, resize_target_bytes)
     log(f"{namespace}/{name}: NAS clone volume={clone_volume_id} share={share_name} permission={nas_result.get('permission', '')}")
 
-    source_spec = source_pv.get("spec") or {}
-    source_capacity = ((source_spec.get("capacity") or {}).get("storage")) or str(vs_status.get("restoreSize") or "")
-    requested_capacity = spec.get("capacity")
-    if requested_capacity and source_capacity:
-        requested_bytes = quantity_bytes(requested_capacity)
-        source_bytes = quantity_bytes(source_capacity)
-        if requested_bytes and source_bytes and requested_bytes > source_bytes:
-            raise PermanentReconcileError(f"requested capacity {requested_capacity} exceeds source capacity {source_capacity}")
-    capacity = source_capacity or requested_capacity
-    import_capacity = spec.get("importCapacity") or source_tv_config.get("realSize") or capacity
     mount_options = spec.get("mountOptions") or source_spec.get("mountOptions") or []
     if not mount_options:
         storage_class_obj = kube.get(f"/apis/storage.k8s.io/v1/storageclasses/{urllib.parse.quote(storage_class, safe='')}")

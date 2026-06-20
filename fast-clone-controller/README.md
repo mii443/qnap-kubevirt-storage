@@ -87,6 +87,12 @@ The controller copies mount options from the fast-clone StorageClass to the
 final PV. With the QNAP CSI mount-options patch, those options are applied to
 the actual CIFS mount.
 
+If a target PVC requests more storage than the source golden image, the
+controller expands the NAS clone volume with `qcli_volume -e` before creating
+the final PV, retrying while QNAP reports that the clone is still initializing.
+The PV capacity is set to the requested size. Requests that are smaller than
+the source still produce a PV sized to the source volume.
+
 The older `import-rebind` mode remains useful as a compatibility fallback, but
 it waits for Trident import and is much slower.
 

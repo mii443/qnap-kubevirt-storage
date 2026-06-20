@@ -114,6 +114,13 @@ class Kube:
             path = "/api/v1/persistentvolumeclaims"
         return self.request("GET", path) or {"items": []}
 
+    def list_snapshots(self, namespace):
+        if namespace:
+            path = f"/apis/snapshot.storage.k8s.io/v1/namespaces/{namespace}/volumesnapshots"
+        else:
+            path = "/apis/snapshot.storage.k8s.io/v1/volumesnapshots"
+        return self.request("GET", path) or {"items": []}
+
     def watch_fastclones(self, namespace, resource_version, timeout_seconds):
         if namespace:
             path = f"/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}"
@@ -152,6 +159,39 @@ class Kube:
             path = f"/api/v1/namespaces/{namespace}/persistentvolumeclaims"
         else:
             path = "/api/v1/persistentvolumeclaims"
+        query = urllib.parse.urlencode(
+            {
+                "watch": "true",
+                "allowWatchBookmarks": "true",
+                "resourceVersion": resource_version or "",
+                "timeoutSeconds": str(timeout_seconds),
+            }
+        )
+        url = f"{self.base}{path}?{query}"
+        cmd = [
+            "curl",
+            "-sS",
+            "-N",
+            "--no-buffer",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            str(int(timeout_seconds) + 30),
+            "--cacert",
+            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+            "-H",
+            "Accept: application/json",
+            "-H",
+            f"Authorization: Bearer {self.token}",
+            url,
+        ]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    def watch_snapshots(self, namespace, resource_version, timeout_seconds):
+        if namespace:
+            path = f"/apis/snapshot.storage.k8s.io/v1/namespaces/{namespace}/volumesnapshots"
+        else:
+            path = "/apis/snapshot.storage.k8s.io/v1/volumesnapshots"
         query = urllib.parse.urlencode(
             {
                 "watch": "true",
@@ -686,6 +726,10 @@ def retry_delay_seconds(retry_count):
     return min(300, 2 ** min(max(retry_count, 1), 8))
 
 
+def source_ready_status(status):
+    return {**status, "message": "", "sourceSnapshotReady": "true"}
+
+
 def parse_snapshot_handle(handle):
     parts = (handle or "").split("/")
     if len(parts) != 2:
@@ -819,6 +863,16 @@ def reconcile(kube, nas, item, source_cache):
         vs_status = vs.get("status") or {}
         if not vs_status.get("readyToUse"):
             log(f"{namespace}/{name}: source snapshot is not ready")
+            message = f"source snapshot {source_snapshot_ns}/{source_snapshot} is not ready"
+            if status.get("phase") != "WaitingForSourceSnapshot" or status.get("message") != message:
+                kube.patch_fastclone_status(namespace, name, {
+                    **status,
+                    "phase": "WaitingForSourceSnapshot",
+                    "message": message,
+                    "sourceSnapshotName": source_snapshot,
+                    "sourceSnapshotNamespace": source_snapshot_ns,
+                    "sourceSnapshotReady": "false",
+                })
             return
         vsc_name = vs_status.get("boundVolumeSnapshotContentName")
         if not vsc_name:
@@ -879,9 +933,9 @@ def reconcile(kube, nas, item, source_cache):
             log(f"{namespace}/{name}: target import PVC unchanged phase={phase}")
             return
         if phase == "Bound":
-            kube.patch_fastclone_status(namespace, name, {**status, "phase": "Ready", "targetPVName": bound_pv, "targetPVCName": target_pvc, "targetPVCPhase": phase})
+            kube.patch_fastclone_status(namespace, name, {**source_ready_status(status), "phase": "Ready", "targetPVName": bound_pv, "targetPVCName": target_pvc, "targetPVCPhase": phase})
         else:
-            kube.patch_fastclone_status(namespace, name, {**status, "phase": "Importing", "targetPVName": bound_pv, "targetPVCName": target_pvc, "targetPVCPhase": phase})
+            kube.patch_fastclone_status(namespace, name, {**source_ready_status(status), "phase": "Importing", "targetPVName": bound_pv, "targetPVCName": target_pvc, "targetPVCPhase": phase})
         log(f"{namespace}/{name}: target import PVC already exists phase={phase}")
         return
     if existing_pv and existing_pvc:
@@ -917,7 +971,7 @@ def reconcile(kube, nas, item, source_cache):
                 {"spec": {"volumeName": pv_name}},
             )
         phase = (existing_pvc.get("status") or {}).get("phase")
-        kube.patch_fastclone_status(namespace, name, {**status, "phase": "Ready", "targetPVName": pv_name, "targetPVCName": target_pvc, "targetPVCPhase": phase})
+        kube.patch_fastclone_status(namespace, name, {**source_ready_status(status), "phase": "Ready", "targetPVName": pv_name, "targetPVCName": target_pvc, "targetPVCPhase": phase})
         log(f"{namespace}/{name}: target already exists phase={phase}")
         return
 
@@ -1098,7 +1152,7 @@ def reconcile(kube, nas, item, source_cache):
             if reclaim_policy:
                 kube.patch(f"/api/v1/persistentvolumes/{bound_pv}", {"spec": {"persistentVolumeReclaimPolicy": reclaim_policy}})
             kube.patch_fastclone_status(namespace, name, {
-                **status,
+                **source_ready_status(status),
                 "phase": "Ready",
                 "nasCloneName": clone_name,
                 "nasVolumeID": clone_volume_id,
@@ -1114,7 +1168,7 @@ def reconcile(kube, nas, item, source_cache):
             log(f"{namespace}/{name}: imported {target_ns}/{target_pvc} via {share_name} pv={bound_pv}")
         else:
             kube.patch_fastclone_status(namespace, name, {
-                **status,
+                **source_ready_status(status),
                 "phase": "Importing",
                 "nasCloneName": clone_name,
                 "nasVolumeID": clone_volume_id,
@@ -1165,7 +1219,7 @@ def reconcile(kube, nas, item, source_cache):
         import_pv_name = (import_pvc.get("spec") or {}).get("volumeName", "")
         if import_phase != "Bound" or not import_pv_name:
             kube.patch_fastclone_status(namespace, name, {
-                **status,
+                **source_ready_status(status),
                 "phase": "Importing",
                 "nasCloneName": clone_name,
                 "nasVolumeID": clone_volume_id,
@@ -1239,7 +1293,7 @@ def reconcile(kube, nas, item, source_cache):
             final_phase = "Bound"
 
         kube.patch_fastclone_status(namespace, name, {
-            **status,
+            **source_ready_status(status),
             "phase": "Ready" if final_phase == "Bound" else "Importing",
             "nasCloneName": clone_name,
             "nasVolumeID": clone_volume_id,
@@ -1281,7 +1335,7 @@ def reconcile(kube, nas, item, source_cache):
         )
 
     kube.patch_fastclone_status(namespace, name, {
-        **status,
+        **source_ready_status(status),
         "phase": "Ready",
         "nasCloneName": clone_name,
         "nasVolumeID": clone_volume_id,
@@ -1408,6 +1462,48 @@ def reconcile_existing_pvcs(kube, namespace):
     return ((listed.get("metadata") or {}).get("resourceVersion")) or ""
 
 
+def list_snapshots_for_watch(kube, namespace):
+    listed = kube.list_snapshots(namespace)
+    items = listed.get("items", [])
+    ns_label = namespace or "all namespaces"
+    log(f"listed {len(items)} volumesnapshots in {ns_label}")
+    return ((listed.get("metadata") or {}).get("resourceVersion")) or ""
+
+
+def invalidate_snapshot_cache(source_cache, namespace, name):
+    prefix = f"{namespace}/{name}/"
+    for key in list(source_cache):
+        if key.startswith(prefix):
+            source_cache.pop(key, None)
+
+
+def reconcile_fastclones_for_snapshot(kube, nas, source_cache, namespaces, snapshot):
+    meta = snapshot.get("metadata") or {}
+    snapshot_ns = meta.get("namespace", "")
+    snapshot_name = meta.get("name", "")
+    if not snapshot_ns or not snapshot_name:
+        return
+    if not ((snapshot.get("status") or {}).get("readyToUse")):
+        return
+
+    invalidate_snapshot_cache(source_cache, snapshot_ns, snapshot_name)
+    search_namespaces = [""] if "" in namespaces else namespaces
+    matched = 0
+    for namespace in search_namespaces:
+        listed = kube.list_fastclones(namespace)
+        for item in listed.get("items", []):
+            spec = item.get("spec") or {}
+            item_ns = (item.get("metadata") or {}).get("namespace", "")
+            if spec.get("sourceSnapshotName") != snapshot_name:
+                continue
+            if spec.get("sourceSnapshotNamespace", item_ns) != snapshot_ns:
+                continue
+            matched += 1
+            reconcile_item(kube, nas, item, source_cache)
+    if matched:
+        log(f"{snapshot_ns}/{snapshot_name}: reconciled {matched} fast clone(s) after snapshot became ready")
+
+
 def stop_watch(proc):
     if proc.poll() is None:
         proc.terminate()
@@ -1464,6 +1560,8 @@ def main():
                 if auto_provision_pvcs:
                     pvc_resource_version = reconcile_existing_pvcs(kube, namespace)
 
+                snapshot_resource_version = list_snapshots_for_watch(kube, namespace)
+
                 qfc_proc = kube.watch_fastclones(namespace, qfc_resource_version, watch_timeout)
                 watches[qfc_proc.stdout.fileno()] = (f"qnapfastclones[{ns_label}]", qfc_proc)
                 log(f"watching qnapfastclones in {ns_label} resourceVersion={qfc_resource_version}")
@@ -1471,6 +1569,9 @@ def main():
                     pvc_proc = kube.watch_pvcs(namespace, pvc_resource_version, watch_timeout)
                     watches[pvc_proc.stdout.fileno()] = (f"pvcs[{ns_label}]", pvc_proc)
                     log(f"watching pvcs in {ns_label} resourceVersion={pvc_resource_version}")
+                snapshot_proc = kube.watch_snapshots(namespace, snapshot_resource_version, watch_timeout)
+                watches[snapshot_proc.stdout.fileno()] = (f"volumesnapshots[{ns_label}]", snapshot_proc)
+                log(f"watching volumesnapshots in {ns_label} resourceVersion={snapshot_resource_version}")
 
             while watches:
                 ready, _, _ = select.select(list(watches.keys()), [], [], watch_timeout + 35)
@@ -1494,6 +1595,8 @@ def main():
                         handle_fastclone_watch_line(kube, nas, source_cache, line)
                     elif watch_name.startswith("pvcs"):
                         handle_pvc_watch_line(kube, line)
+                    elif watch_name.startswith("volumesnapshots"):
+                        handle_snapshot_watch_line(kube, nas, source_cache, namespaces, line)
 
             for _, proc in list(watches.values()):
                 stop_watch(proc)
@@ -1551,6 +1654,32 @@ def handle_pvc_watch_line(kube, line):
         return
     else:
         log(f"ignored pvc watch event type={event_type}")
+
+
+def handle_snapshot_watch_line(kube, nas, source_cache, namespaces, line):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError as e:
+        log(f"volumesnapshot watch decode error: {e}: {line[:200]}")
+        return
+    event_type = event.get("type", "")
+    obj = event.get("object") or {}
+    kind = obj.get("kind", "")
+    if event_type == "BOOKMARK":
+        return
+    if kind == "Status":
+        reason = obj.get("reason", "")
+        code = obj.get("code", "")
+        message = obj.get("message", "")
+        log(f"volumesnapshot watch status event code={code} reason={reason}: {message}")
+        return
+    if event_type in ("ADDED", "MODIFIED"):
+        reconcile_fastclones_for_snapshot(kube, nas, source_cache, namespaces, obj)
+    elif event_type == "DELETED":
+        meta = obj.get("metadata") or {}
+        invalidate_snapshot_cache(source_cache, meta.get("namespace", ""), meta.get("name", ""))
+    else:
+        log(f"ignored volumesnapshot watch event type={event_type}")
 
 
 if __name__ == "__main__":

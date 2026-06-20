@@ -96,6 +96,11 @@ the source still produce a PV sized to the source volume.
 The older `import-rebind` mode remains useful as a compatibility fallback, but
 it waits for Trident import and is much slower.
 
+The controller watches `VolumeSnapshot` updates, so a snapshot and a fast-clone
+PVC can be applied in the same manifest. If the PVC is reconciled before the
+snapshot is ready, the clone waits and resumes as soon as the snapshot reports
+`readyToUse`.
+
 Observed tests on the golden Ubuntu image:
 
 ```text

@@ -42,6 +42,17 @@ kubectl apply -f manifests/storageclass-fastclone.yaml
 kubectl apply -f manifests/deployment.yaml
 ```
 
+The deployment watches `vm-images,cloud` by default:
+
+```yaml
+env:
+  - name: WATCH_NAMESPACES
+    value: vm-images,cloud
+```
+
+Use `WATCH_NAMESPACES=*` or an empty value to watch all namespaces.  The older
+single namespace `WATCH_NAMESPACE` variable is still supported for compatibility.
+
 Create a clone by making a PVC with `storageClassName: qnap-fastclone` and a
 `VolumeSnapshot` data source:
 

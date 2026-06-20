@@ -1314,7 +1314,8 @@ def ensure_fastclone_for_pvc(kube, pvc):
 def reconcile_existing_pvcs(kube, namespace):
     listed = kube.list_pvcs(namespace)
     items = listed.get("items", [])
-    log(f"listed {len(items)} pvcs for fast clone provisioning")
+    ns_label = namespace or "all namespaces"
+    log(f"listed {len(items)} pvcs in {ns_label} for fast clone provisioning")
     for pvc in items:
         ensure_fastclone_for_pvc(kube, pvc)
     return ((listed.get("metadata") or {}).get("resourceVersion")) or ""
@@ -1341,37 +1342,48 @@ def log_watch_exit(name, proc):
         log(f"{name} watch ended; restarting")
 
 
+def watch_namespaces():
+    raw = os.environ.get("WATCH_NAMESPACES", os.environ.get("WATCH_NAMESPACE", ""))
+    raw = raw.strip()
+    if raw in ("", "*", "all"):
+        return [""]
+    namespaces = [item.strip() for item in raw.split(",") if item.strip()]
+    return namespaces or [""]
+
+
 def main():
-    namespace = os.environ.get("WATCH_NAMESPACE", "")
+    namespaces = watch_namespaces()
     watch_timeout = int(os.environ.get("WATCH_TIMEOUT_SECONDS", "300"))
     watch_restart_sleep = float(os.environ.get("WATCH_RESTART_SLEEP_SECONDS", "1"))
     auto_provision_pvcs = os.environ.get("AUTO_PROVISION_PVCS", "true").lower() in ("1", "true", "yes")
     kube = Kube()
     nas = Nas()
     source_cache = {}
-    log("qnap fast-clone controller started")
+    namespace_label = ", ".join(namespace or "all namespaces" for namespace in namespaces)
+    log(f"qnap fast-clone controller started namespaces={namespace_label}")
     while True:
-        qfc_resource_version = ""
-        pvc_resource_version = ""
         watches = {}
         try:
-            listed = kube.list_fastclones(namespace)
-            qfc_resource_version = ((listed.get("metadata") or {}).get("resourceVersion")) or ""
-            items = listed.get("items", [])
-            log(f"listed {len(items)} qnapfastclones resourceVersion={qfc_resource_version}")
-            for item in items:
-                reconcile_item(kube, nas, item, source_cache)
+            for namespace in namespaces:
+                ns_label = namespace or "all namespaces"
+                listed = kube.list_fastclones(namespace)
+                qfc_resource_version = ((listed.get("metadata") or {}).get("resourceVersion")) or ""
+                items = listed.get("items", [])
+                log(f"listed {len(items)} qnapfastclones in {ns_label} resourceVersion={qfc_resource_version}")
+                for item in items:
+                    reconcile_item(kube, nas, item, source_cache)
 
-            if auto_provision_pvcs:
-                pvc_resource_version = reconcile_existing_pvcs(kube, namespace)
+                pvc_resource_version = ""
+                if auto_provision_pvcs:
+                    pvc_resource_version = reconcile_existing_pvcs(kube, namespace)
 
-            qfc_proc = kube.watch_fastclones(namespace, qfc_resource_version, watch_timeout)
-            watches[qfc_proc.stdout.fileno()] = ("qnapfastclones", qfc_proc)
-            log(f"watching qnapfastclones resourceVersion={qfc_resource_version}")
-            if auto_provision_pvcs:
-                pvc_proc = kube.watch_pvcs(namespace, pvc_resource_version, watch_timeout)
-                watches[pvc_proc.stdout.fileno()] = ("pvcs", pvc_proc)
-                log(f"watching pvcs resourceVersion={pvc_resource_version}")
+                qfc_proc = kube.watch_fastclones(namespace, qfc_resource_version, watch_timeout)
+                watches[qfc_proc.stdout.fileno()] = (f"qnapfastclones[{ns_label}]", qfc_proc)
+                log(f"watching qnapfastclones in {ns_label} resourceVersion={qfc_resource_version}")
+                if auto_provision_pvcs:
+                    pvc_proc = kube.watch_pvcs(namespace, pvc_resource_version, watch_timeout)
+                    watches[pvc_proc.stdout.fileno()] = (f"pvcs[{ns_label}]", pvc_proc)
+                    log(f"watching pvcs in {ns_label} resourceVersion={pvc_resource_version}")
 
             while watches:
                 ready, _, _ = select.select(list(watches.keys()), [], [], watch_timeout + 35)
@@ -1391,9 +1403,9 @@ def main():
                     line = line.strip()
                     if not line:
                         continue
-                    if watch_name == "qnapfastclones":
+                    if watch_name.startswith("qnapfastclones"):
                         handle_fastclone_watch_line(kube, nas, source_cache, line)
-                    elif watch_name == "pvcs":
+                    elif watch_name.startswith("pvcs"):
                         handle_pvc_watch_line(kube, line)
 
             for _, proc in list(watches.values()):

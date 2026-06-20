@@ -16,11 +16,11 @@ spec:
       serviceAccountName: qnap-fast-clone-controller
       containers:
         - name: controller
-          image: registry.mii.dev/qnap-fast-clone-controller:0.1.24
+          image: registry.mii.dev/qnap-fast-clone-controller:0.1.25
           imagePullPolicy: IfNotPresent
           env:
-            - name: WATCH_NAMESPACE
-              value: vm-images
+            - name: WATCH_NAMESPACES
+              value: vm-images,cloud
             - name: AUTO_PROVISION_PVCS
               value: "true"
             - name: FAST_CLONE_STORAGE_CLASS_NAME
